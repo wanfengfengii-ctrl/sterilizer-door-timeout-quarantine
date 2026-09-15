@@ -1,0 +1,49 @@
+name: cssd-unload
+
+# 默认 `docker compose up` 只运行 api 与 worker 两个应用组件；
+# verify 是一次性验收服务，位于独立 profile 下，需显式启动（见 README）。
+services:
+  api:
+    build: .
+    command: ["/app/api"]
+    environment:
+      DATABASE_PATH: /data/cssd.db
+      PORT: "8080"
+    volumes:
+      - cssd-data:/data
+    ports:
+      # 宿主端口可用 API_PORT 环境变量覆盖，默认 8080。
+      - "${API_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 5s
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["/app/worker"]
+    environment:
+      DATABASE_PATH: /data/cssd.db
+      SCAN_INTERVAL: 1s
+    volumes:
+      # 与 api 共享同一个 SQLite 数据库文件，数据库是两进程的唯一裁决依据。
+      - cssd-data:/data
+    restart: unless-stopped
+
+  verify:
+    build: .
+    command: ["/app/verify"]
+    profiles: ["verify"]
+    environment:
+      API_BASE_URL: http://api:8080
+    depends_on:
+      api:
+        condition: service_healthy
+      worker:
+        condition: service_started
+
+volumes:
+  cssd-data:
