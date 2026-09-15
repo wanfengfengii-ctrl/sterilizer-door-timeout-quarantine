@@ -39,10 +39,20 @@ const (
 	ReasonScanTimeout          = "scan_timeout"           // worker 扫描发现窗口已到期
 )
 
-// WindowTTLSeconds 是卸载窗口的确认时限（秒）：登记时由数据库 UTC 当前
-// 时间加 30 秒生成截止时刻。注意：该常量必须与 registerWindowSQL 中的
-// '+30 seconds' 修饰符保持一致。
-const WindowTTLSeconds = 30
+// 卸载窗口确认时限策略：未单独配置的设备一律使用默认 30 秒；集成方可通过
+// UpdateDevicePolicy 提交 [MinWindowTTLSeconds, MaxWindowTTLSeconds] 区间内
+// 的整数秒数。登记窗口时在同一事务内读取设备当前策略并把秒数快照到窗口行，
+// 之后策略如何变化都不影响已登记窗口的截止时刻。
+const (
+	// DefaultWindowTTLSeconds 是未配置设备的默认确认时限（秒）。
+	DefaultWindowTTLSeconds = 30
+	// MinWindowTTLSeconds / MaxWindowTTLSeconds 是策略允许的整数秒边界。
+	MinWindowTTLSeconds = 1
+	MaxWindowTTLSeconds = 600
+)
+
+// WindowTTLSeconds 保留为默认时限的别名（历史名称）。
+const WindowTTLSeconds = DefaultWindowTTLSeconds
 
 var (
 	ErrDeviceNotFound    = errors.New("device not found")
@@ -50,32 +60,41 @@ var (
 	ErrWindowAlreadyOpen = errors.New("device already has an open unload window")
 	ErrNoOpenWindow      = errors.New("device has no open unload window")
 	ErrWindowNotFound    = errors.New("unload window not found")
+	// ErrInvalidPolicy 表示策略秒数不是 [1,600] 区间内的整数。
+	ErrInvalidPolicy = errors.New("unload ttl seconds must be an integer between 1 and 600")
 )
 
-// Device 是一台灭菌柜设备。
+// Device 是一台灭菌柜设备。UnloadTTLSeconds 是该设备当前的开门确认时限
+// 策略（秒）；未配置时为 DefaultWindowTTLSeconds。
 type Device struct {
-	ID        string `json:"device_id"`
-	Name      string `json:"name"`
-	CreatedAt string `json:"created_at"`
+	ID               string `json:"device_id"`
+	Name             string `json:"name"`
+	CreatedAt        string `json:"created_at"`
+	UnloadTTLSeconds int    `json:"unload_ttl_seconds"`
 }
 
 // Window 是一次卸载窗口。OpenedAt / Deadline / ClosedAt 均为数据库生成的
 // UTC 时间串，格式为 YYYY-MM-DDTHH:MM:SS.SSSZ（毫秒精度，字典序即时间序）。
+// TTLSeconds 是登记瞬间从设备策略快照下来的确认时限（秒），窗口此后与设备
+// 当前策略脱钩：Deadline 始终等于 OpenedAt + TTLSeconds。
 type Window struct {
 	ID          int64   `json:"id"`
 	DeviceID    string  `json:"device_id"`
 	State       string  `json:"state"`
 	OpenedAt    string  `json:"opened_at"`
 	Deadline    string  `json:"deadline"`
+	TTLSeconds  int     `json:"ttl_seconds"`
 	ClosedAt    *string `json:"closed_at"`
 	CloseReason *string `json:"close_reason"`
 }
 
 const schema = `
 CREATE TABLE IF NOT EXISTS devices (
-    id         TEXT PRIMARY KEY,
-    name       TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    id                 TEXT PRIMARY KEY,
+    name               TEXT NOT NULL,
+    created_at         TEXT NOT NULL,
+    unload_ttl_seconds INTEGER NOT NULL DEFAULT 30
+                               CHECK (unload_ttl_seconds BETWEEN 1 AND 600)
 );
 
 CREATE TABLE IF NOT EXISTS unload_windows (
@@ -84,6 +103,7 @@ CREATE TABLE IF NOT EXISTS unload_windows (
     state        TEXT NOT NULL CHECK (state IN ('open', 'confirmed', 'quarantined')),
     opened_at    TEXT NOT NULL,
     deadline     TEXT NOT NULL,
+    ttl_seconds  INTEGER NOT NULL CHECK (ttl_seconds BETWEEN 1 AND 600),
     closed_at    TEXT,
     close_reason TEXT
 );
@@ -98,15 +118,33 @@ CREATE INDEX IF NOT EXISTS ix_unload_windows_open_deadline
     ON unload_windows (deadline) WHERE state = 'open';
 `
 
-const windowColumns = "id, device_id, state, opened_at, deadline, closed_at, close_reason"
+// 旧版本数据库的追加式迁移：新列以默认 30 秒补齐，既有窗口的截止时刻本就按
+// 30 秒生成，回填值与其语义一致。迁移逐列幂等执行。
+const (
+	migrateDevicesPolicyCol = `ALTER TABLE devices
+	    ADD COLUMN unload_ttl_seconds INTEGER NOT NULL DEFAULT 30`
+	migrateWindowsTTLCol = `ALTER TABLE unload_windows
+	    ADD COLUMN ttl_seconds INTEGER NOT NULL DEFAULT 30`
+)
 
-// registerWindowSQL 的 opened_at 与 deadline 由同一条 INSERT 内的数据库
-// UTC 当前时间生成（deadline = now + 30 秒），客户端无法指定。
+const deviceColumns = "id, name, created_at, unload_ttl_seconds"
+
+const windowColumns = "id, device_id, state, opened_at, deadline, ttl_seconds, closed_at, close_reason"
+
+// registerWindowSQL 在单条 INSERT...SELECT（即 SQLite 的一个隐式事务）内完成
+// 三件事：读取设备当前 unload_ttl_seconds 策略、用同一数据库 UTC 时刻生成
+// opened_at 与 deadline（deadline = now + 策略秒数）、把采用的秒数快照到
+// ttl_seconds 列。策略在窗口存续期间再被修改也触碰不到已登记窗口：窗口行
+// 不与 devices 表做任何运行期联接。设备不存在时 SELECT 端无行，INSERT 命中
+// 0 行，调用方映射为 ErrDeviceNotFound。
 const registerWindowSQL = `
-INSERT INTO unload_windows (device_id, state, opened_at, deadline)
-VALUES (?, 'open',
-        strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-        strftime('%Y-%m-%dT%H:%M:%fZ','now','+30 seconds'))
+INSERT INTO unload_windows (device_id, state, opened_at, deadline, ttl_seconds)
+SELECT d.id, 'open',
+       strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+       strftime('%Y-%m-%dT%H:%M:%fZ','now', '+' || d.unload_ttl_seconds || ' seconds'),
+       d.unload_ttl_seconds
+FROM devices AS d
+WHERE d.id = ?
 RETURNING ` + windowColumns
 
 // confirmWindowSQL 在单条 UPDATE 内完成裁决：数据库 UTC 当前时间严格早于
@@ -155,11 +193,64 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
-	if _, err := db.ExecContext(ctx, schema); err != nil {
+	if err := migrate(ctx, db); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("migrate schema: %w", err)
+		return nil, err
 	}
 	return &Store{db: db}, nil
+}
+
+// migrate 幂等地执行建表与旧库追加列迁移：ALTER TABLE 不支持 IF NOT EXISTS，
+// 因此先通过 PRAGMA table_info 判断列是否已存在，避免重复执行报错。
+func migrate(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, schema); err != nil {
+		return fmt.Errorf("migrate schema: %w", err)
+	}
+	migrations := []struct {
+		table  string
+		column string
+		stmt   string
+	}{
+		{"devices", "unload_ttl_seconds", migrateDevicesPolicyCol},
+		{"unload_windows", "ttl_seconds", migrateWindowsTTLCol},
+	}
+	for _, m := range migrations {
+		exists, err := columnExists(ctx, db, m.table, m.column)
+		if err != nil {
+			return err
+		}
+		if exists {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, m.stmt); err != nil {
+			return fmt.Errorf("migrate add %s.%s: %w", m.table, m.column, err)
+		}
+	}
+	return nil
+}
+
+func columnExists(ctx context.Context, db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return false, fmt.Errorf("inspect table %s: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notNull, pk int
+		var dflt any
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			return false, fmt.Errorf("inspect table %s: %w", table, err)
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("inspect table %s: %w", table, err)
+	}
+	return false, nil
 }
 
 // Close 关闭底层数据库连接池。
@@ -169,13 +260,14 @@ func (s *Store) Close() error { return s.db.Close() }
 func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
 
 // CreateDevice 登记一台设备；设备已存在时返回 ErrDeviceExists。
+// 新设备不携带单独策略，使用 DefaultWindowTTLSeconds（列默认值）。
 func (s *Store) CreateDevice(ctx context.Context, id, name string) (Device, error) {
 	var d Device
 	err := s.db.QueryRowContext(ctx, `
 		INSERT INTO devices (id, name, created_at)
 		VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-		RETURNING id, name, created_at`, id, name).
-		Scan(&d.ID, &d.Name, &d.CreatedAt)
+		RETURNING `+deviceColumns, id, name).
+		Scan(&d.ID, &d.Name, &d.CreatedAt, &d.UnloadTTLSeconds)
 	switch {
 	case err == nil:
 		return d, nil
@@ -190,8 +282,8 @@ func (s *Store) CreateDevice(ctx context.Context, id, name string) (Device, erro
 func (s *Store) GetDevice(ctx context.Context, id string) (Device, error) {
 	var d Device
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, created_at FROM devices WHERE id = ?`, id).
-		Scan(&d.ID, &d.Name, &d.CreatedAt)
+		`SELECT `+deviceColumns+` FROM devices WHERE id = ?`, id).
+		Scan(&d.ID, &d.Name, &d.CreatedAt, &d.UnloadTTLSeconds)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return Device{}, ErrDeviceNotFound
@@ -202,18 +294,46 @@ func (s *Store) GetDevice(ctx context.Context, id string) (Device, error) {
 	}
 }
 
+// UpdateDevicePolicy 更新设备的开门确认时限策略（整数秒，[1,600] 闭区间）。
+// 更新只写 devices 一行（单条原子 UPDATE，天然不存在半写入配置），既不会
+// 触碰该设备任何既有窗口，也不依赖它们的状态——活动窗口的 deadline 与
+// ttl_seconds 快照保持不变。设备不存在时返回 ErrDeviceNotFound；越界值在
+// 进入 SQL 前由 ErrInvalidPolicy 拦截（CHECK 约束是第二道防线）。
+func (s *Store) UpdateDevicePolicy(ctx context.Context, deviceID string, ttlSeconds int) (Device, error) {
+	if ttlSeconds < MinWindowTTLSeconds || ttlSeconds > MaxWindowTTLSeconds {
+		return Device{}, ErrInvalidPolicy
+	}
+	var d Device
+	err := s.db.QueryRowContext(ctx, `
+		UPDATE devices
+		SET unload_ttl_seconds = ?
+		WHERE id = ?
+		RETURNING `+deviceColumns, ttlSeconds, deviceID).
+		Scan(&d.ID, &d.Name, &d.CreatedAt, &d.UnloadTTLSeconds)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return Device{}, ErrDeviceNotFound
+	case err != nil:
+		return Device{}, fmt.Errorf("update device policy: %w", err)
+	default:
+		return d, nil
+	}
+}
+
 // RegisterWindow 为设备登记一个卸载窗口，返回包含数据库生成的 opened_at
-// 与 deadline 的窗口。设备不存在时返回 ErrDeviceNotFound；设备已有 open
-// 窗口时返回 ErrWindowAlreadyOpen（由部分唯一索引在并发下同样成立）。
+// 与 deadline 的窗口。设备不存在时返回 ErrDeviceNotFound（策略 SELECT 端
+// 无行，INSERT 命中 0 行）；设备已有 open 窗口时返回 ErrWindowAlreadyOpen
+// （由部分唯一索引在并发下同样成立）。
 func (s *Store) RegisterWindow(ctx context.Context, deviceID string) (Window, error) {
 	w, err := scanWindow(s.db.QueryRowContext(ctx, registerWindowSQL, deviceID))
 	switch {
 	case err == nil:
 		return w, nil
+	case errors.Is(err, sql.ErrNoRows):
+		// INSERT...SELECT 的源行只可能是设备缺失（FK 不再参与判定）。
+		return Window{}, ErrDeviceNotFound
 	case isUniqueViolation(err):
 		return Window{}, ErrWindowAlreadyOpen
-	case isForeignKeyViolation(err):
-		return Window{}, ErrDeviceNotFound
 	default:
 		return Window{}, fmt.Errorf("register window: %w", err)
 	}
@@ -287,7 +407,7 @@ func (s *Store) LatestWindow(ctx context.Context, deviceID string) (Window, erro
 func scanWindow(row *sql.Row) (Window, error) {
 	var w Window
 	var closedAt, closeReason sql.NullString
-	if err := row.Scan(&w.ID, &w.DeviceID, &w.State, &w.OpenedAt, &w.Deadline, &closedAt, &closeReason); err != nil {
+	if err := row.Scan(&w.ID, &w.DeviceID, &w.State, &w.OpenedAt, &w.Deadline, &w.TTLSeconds, &closedAt, &closeReason); err != nil {
 		return Window{}, err
 	}
 	if closedAt.Valid {
@@ -306,13 +426,4 @@ func isUniqueViolation(err error) bool {
 		return serr.Code() == 2067
 	}
 	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
-}
-
-// isForeignKeyViolation 判定 SQLite 外键约束冲突（SQLITE_CONSTRAINT_FOREIGNKEY=787）。
-func isForeignKeyViolation(err error) bool {
-	var serr *sqlite.Error
-	if errors.As(err, &serr) {
-		return serr.Code() == 787
-	}
-	return err != nil && strings.Contains(err.Error(), "FOREIGN KEY constraint failed")
 }

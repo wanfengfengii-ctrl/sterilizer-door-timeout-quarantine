@@ -5,6 +5,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"maps"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -44,6 +46,7 @@ func NewServer(st *store.Store) *Server {
 	r.GET("/health", s.health)
 	r.POST("/devices", s.createDevice)
 	r.GET("/devices/:deviceID/status", s.deviceStatus)
+	r.PUT("/devices/:deviceID/policy", s.updateDevicePolicy)
 	r.POST("/devices/:deviceID/windows", s.registerWindow)
 	r.POST("/devices/:deviceID/confirm", s.confirmWindow)
 	return s
@@ -99,6 +102,97 @@ func (s *Server) createDevice(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, CodeInternal, "failed to create device", nil)
 	default:
 		c.JSON(http.StatusCreated, gin.H{"device": d})
+	}
+}
+
+// policyField 是策略更新接口接受的唯一字段；使用 json.RawMessage 保留原始
+// JSON token，以便严格区分整数数字与字符串/布尔/null 等非数字写法。
+type updatePolicyRequest struct {
+	UnloadTTLSeconds json.RawMessage `json:"unload_ttl_seconds"`
+}
+
+func policyErrorDetails() map[string]any {
+	return map[string]any{
+		"field": "unload_ttl_seconds",
+		"min":   store.MinWindowTTLSeconds,
+		"max":   store.MaxWindowTTLSeconds,
+	}
+}
+
+// updateDevicePolicy 处理 PUT /devices/:deviceID/policy：集成方提交 1..600
+// 的整数秒开门确认时限。校验失败一律返回 400 INVALID_REQUEST 的结构化错误；
+// 设备不存在返回原有的 404 DEVICE_NOT_FOUND。更新是单条原子 UPDATE，不会
+// 产生半写入配置，也不影响设备既有窗口。
+func (s *Server) updateDevicePolicy(c *gin.Context) {
+	deviceID := c.Param("deviceID")
+
+	raw, err := io.ReadAll(io.LimitReader(c.Request.Body, 1<<20))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, CodeInvalidRequest, "failed to read request body", policyErrorDetails())
+		return
+	}
+	var req updatePolicyRequest
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, CodeInvalidRequest,
+			"request body must be a JSON object with exactly one integer field \"unload_ttl_seconds\"",
+			policyErrorDetails())
+		return
+	}
+	// 拒绝第二个 JSON 值（如尾随文档/垃圾字符）。
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		writeError(c, http.StatusBadRequest, CodeInvalidRequest,
+			"request body must contain a single JSON object", policyErrorDetails())
+		return
+	}
+	if len(req.UnloadTTLSeconds) == 0 {
+		writeError(c, http.StatusBadRequest, CodeInvalidRequest,
+			"missing required integer field \"unload_ttl_seconds\"", policyErrorDetails())
+		return
+	}
+	// 仅接受整数数字字面量：先看原始 token 的首字符剔除字符串/布尔/null/对象，
+	// 再由 Atoi 拒绝小数、指数、符号与溢出（30.0、1e2、"30"、true 均被拒绝）。
+	token := strings.TrimSpace(string(req.UnloadTTLSeconds))
+	if token == "" || (token[0] != '-' && (token[0] < '0' || token[0] > '9')) {
+		writeError(c, http.StatusBadRequest, CodeInvalidRequest,
+			fmt.Sprintf("unload_ttl_seconds must be an integer between %d and %d, got %s",
+				store.MinWindowTTLSeconds, store.MaxWindowTTLSeconds, token),
+			policyErrorDetails())
+		return
+	}
+	ttl, err := strconv.Atoi(token)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, CodeInvalidRequest,
+			fmt.Sprintf("unload_ttl_seconds must be an integer between %d and %d, got %s",
+				store.MinWindowTTLSeconds, store.MaxWindowTTLSeconds, token),
+			policyErrorDetails())
+		return
+	}
+	if ttl < store.MinWindowTTLSeconds || ttl > store.MaxWindowTTLSeconds {
+		writeError(c, http.StatusBadRequest, CodeInvalidRequest,
+			fmt.Sprintf("unload_ttl_seconds must be between %d and %d seconds, got %d",
+				store.MinWindowTTLSeconds, store.MaxWindowTTLSeconds, ttl),
+			policyErrorDetails())
+		return
+	}
+
+	d, err := s.st.UpdateDevicePolicy(c.Request.Context(), deviceID, ttl)
+	switch {
+	case errors.Is(err, store.ErrDeviceNotFound):
+		writeError(c, http.StatusNotFound, CodeDeviceNotFound,
+			fmt.Sprintf("device %q not found", deviceID), nil)
+	case errors.Is(err, store.ErrInvalidPolicy):
+		// 存储层 CHECK 的防线，正常情况下 HTTP 层校验已拦截。
+		writeError(c, http.StatusBadRequest, CodeInvalidRequest,
+			fmt.Sprintf("unload_ttl_seconds must be between %d and %d seconds",
+				store.MinWindowTTLSeconds, store.MaxWindowTTLSeconds),
+			policyErrorDetails())
+	case err != nil:
+		writeError(c, http.StatusInternalServerError, CodeInternal, "failed to update device policy", nil)
+	default:
+		c.JSON(http.StatusOK, gin.H{"device": d})
 	}
 }
 
